@@ -1,0 +1,22 @@
+version: '3'
+services:
+  node1:
+    build: .
+    environment:
+      - NODE_ID=1
+      - PORT=8086
+  node2:
+    build: .
+    environment:
+      - NODE_ID=2
+      - PORT=8087
+  node3:
+    build: .
+    environment:
+      - NODE_ID=3
+      - PORT=8088
+  node4:
+    build: .
+    environment:
+      - NODE_ID=4
+      - PORT=8089
