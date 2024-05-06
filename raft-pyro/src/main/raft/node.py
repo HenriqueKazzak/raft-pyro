@@ -2,6 +2,7 @@ import os
 import random
 import threading
 import time
+from functools import reduce
 from socket import socket, AF_INET, SOCK_STREAM
 from typing import List
 
@@ -50,8 +51,7 @@ class RaftNode:
         self.other_nodes.pop(f"node.{node_id}")
 
         self.daemon = daemon
-        self.ns = Pyro5.api.locate_ns()
-
+        print(f"main thread: {threading.main_thread().ident}")
         self.uri = self.daemon.register(self, objectId=f"node.{node_id}")
         print(f"Node {self.node_id} URI: {self.uri}")
         print(Pyro5.server.DaemonObject(self.daemon).info())
@@ -60,7 +60,7 @@ class RaftNode:
 
         self.current_term = 0
         self.voted_for = None
-        self.log = List[LogEntry]
+        self.log = []
         self.commit_index = 0
         self.last_applied = 0
         self.state = RaftState.FOLLOWER
@@ -70,55 +70,72 @@ class RaftNode:
         self.votes_received = 0
         self.election_timer = threading.Timer(random.uniform(150.00, 300.00) / 1000,
                                               self.handle_election_timeout)
-        self.heartbeat_timer = threading.Timer(random.uniform(150.00, 300.00) / 1000,
+        self.heartbeat_timer = threading.Timer(random.uniform(1000.00, 2000.00) / 1000,
                                                self.handle_heartbeat_timeout).start()
-        self.send_heartbeat_timer = threading.Timer(random.uniform(150.00, 300.00) / 1000, self.send_heartbeat)
 
     def start_election(self):
+        self.reset_election_timer()
         self.election_timer.start()
         self.current_term += 1
         self.state = RaftState.CANDIDATE
         self.voted_for = self.node_id
         self.votes_received = 1
         print(f"Node {self.node_id} starting election for term {self.current_term}")
-
-        self.send_request_vote(self.node_id, self.current_term)
+        threading_pool = []
+        for node_id in self.other_nodes:
+            # self.send_request_vote(self.node_id, node_id, self.current_term)
+            t = threading.Thread(target=self.send_request_vote, args=(self.node_id, node_id, self.current_term))
+            t.start()
+            threading_pool.append(t)
+        for t in threading_pool:
+            t.join()
+        self.election_timer.cancel()
+        if self.votes_received > (len(self.other_nodes) + 1) / 2:
+            self.become_leader()
+        self.voted_for = None
+        self.votes_received = 0
+        self.reset_heartbeat_timer()
 
     def become_leader(self):
         self.state = RaftState.LEADER
         self.leader_id = self.node_id
-        self.next_index = {node_id: len(self.log) + 1 for node_id in self.other_nodes}
-        self.match_index = {node_id: 0 for node_id in self.other_nodes}
 
         print(f"Node {self.node_id} became leader for term {self.current_term}")
 
         # Register in nameserver
-        self.ns.register(f"Lider_Termo{self.current_term}", self.uri)
-        self.send_heartbeat_timer.start()
+        ns = Pyro5.api.locate_ns()
+        ns.register(f"Lider_Termo{self.current_term}", self.uri)
 
-    def append_entry(self):
-        pass
+    def become_follower(self, leader_id, term):
+        self.state = RaftState.FOLLOWER
+        self.leader_id = leader_id
+        self.current_term = term
+        self.voted_for = None
+        self.votes_received = 0
+        self.reset_heartbeat_timer()
+        print(f"Node {self.node_id} became follower for term {self.current_term}")
 
     def commit_entry(self):
         pass
 
-    def send_heartbeat(self):
+    def send_append(self, message=[]):
+        if message is None:
+            message = []
         for node_id in self.other_nodes:
             try:
                 print(f"Node {self.node_id} sending heartbeat to node {node_id}")
                 port = self.other_nodes[node_id]
-                with Pyro5.api.Proxy(f"PYRO:{node_id}@localhost:{port}") as obj:
-                    r = obj.append_entries(self.node_id, self.current_term, len(self.log), self.log[-1].term, [],
-                                           self.commit_index)
-                    print(f"Node {self.node_id} received response from node {node_id}: {r}")
+                obj = Pyro5.api.Proxy(f"PYRO:{node_id}@localhost:{port}")
+                #     def append_entries(self, leader_id, term, prev_log_index, prev_log_term, entries, leader_commit):
+                prev_log_index = reduce(lambda x, y: x + 1, self.log, 0)
+                print(f"Node {self.node_id} sending heartbeat to node {node_id} with prev_log_index {prev_log_index}")
+                r = obj.append_entries(self.node_id, self.current_term, prev_log_index, self.current_term, message,
+                                       self.commit_index)
+                if r[0] is False:
+                    self.become_follower(r[1], r[2])
+                print(f"Node {self.node_id} received response from node {node_id}: {r}")
             except Pyro5.errors.CommunicationError as e:
                 print(f"Node {self.node_id} could not send heartbeat to node {node_id}: {e}")
-        pass
-
-    def reset_send_heartbeat_timer(self):
-        if self.send_heartbeat_timer is not None:
-            self.send_heartbeat_timer.cancel()
-        self.send_heartbeat_timer = threading.Timer(random.uniform(150.00, 300.00) / 1000, self.send_heartbeat)
 
     def reset_election_timer(self):
         if self.election_timer is not None:
@@ -132,10 +149,12 @@ class RaftNode:
             self.heartbeat_timer.cancel()
         if self.state is not RaftState.LEADER:
             print(f"Node {self.node_id} starting heartbeat timer")
-            self.heartbeat_timer = threading.Timer(random.uniform(150.00, 300.00) / 1000, self.handle_heartbeat_timeout)
-            self.heartbeat_timer.start()
-        else:
+            self.heartbeat_timer = threading.Timer(random.uniform(1000.00, 2000.00) / 1000,
+                                                   self.handle_heartbeat_timeout)
+        if self.state is RaftState.LEADER:
             print(f"Node {self.node_id} is leader, not starting heartbeat timer")
+            self.heartbeat_timer = threading.Timer(random.uniform(150.00, 300.00) / 1000, self.send_append, args=([]))
+        self.heartbeat_timer.start()
 
     def handle_election_timeout(self):
         print(f"Node {self.node_id} election timeout")
@@ -145,25 +164,20 @@ class RaftNode:
         print(f"Node {self.node_id} heartbeat timeout")
         self.start_election()
 
-    def send_request_vote(self, candidate_id, term):
-        for node_id in self.other_nodes:
-            try:
-                print(f"Node {self.node_id} sending request vote to node {node_id}")
-                port = self.other_nodes[node_id]
-                with Pyro5.api.Proxy(f"PYRO:{node_id}@localhost:{port}") as obj:
-                    r = obj.request_vote(candidate_id, term)
-                    if r:
-                        self.votes_received += 1
-                        print(f"Votes received: {self.votes_received}")
-                    print(f"Node {self.node_id} received response from node {node_id}: {r}")
-            except Pyro5.errors.CommunicationError as e:
-                print(f"Node {self.node_id} could not send request vote to node {node_id}: {e}")
-        if self.votes_received >= (len(self.other_nodes) + 1) / 2:
-            self.become_leader()
-        self.voted_for = None
-        self.votes_received = 0
-        self.reset_heartbeat_timer()
-        self.reset_election_timer()
+    def send_request_vote(self, candidate_id, node_id, term):
+        try:
+            print(f"Node {self.node_id} sending request vote to node {node_id}")
+            port = self.other_nodes[node_id]
+            print(f"Node {self.node_id} sending request vote to node {node_id} on port {port}")
+            with Pyro5.api.Proxy(f"PYRO:{node_id}@localhost:{port}") as obj:
+                obj._pyroClaimOwnership()
+                r = obj.request_vote(candidate_id, term)
+            if r:
+                self.votes_received += 1
+                print(f"Votes received: {self.votes_received}")
+            print(f"Node {self.node_id} received response from node {node_id}: {r}")
+        except Pyro5.errors.CommunicationError as e:
+            print(f"Node {self.node_id} could not send request vote to node {node_id}: {e}")
 
     # invoked by candidates to gather votes (§5.2).
     # Arguments:
@@ -182,11 +196,11 @@ class RaftNode:
     def request_vote(self, candidate_id, term):
         if term < self.current_term:
             return False
-        if self.voted_for is None or self.voted_for == candidate_id:
-            self.voted_for = candidate_id
-            self.state = RaftState.FOLLOWER
-            return True
-        return False
+        # if self.voted_for is None or self.voted_for == candidate_id:
+        #     self.voted_for = candidate_id
+        #     self.state = RaftState.FOLLOWER
+        #     return True
+        return True
 
     # invoked by leader to replicate log entries (§5.3); also used as
     # heartbeat (§5.2).
@@ -213,21 +227,25 @@ class RaftNode:
     # 4. Append any new entries not already in the log
     # 5. If leaderCommit > commitIndex, set commitIndex =
     # min(leaderCommit, index of last new entry)
-
     @Pyro5.server.expose
     def append_entries(self, leader_id, term, prev_log_index, prev_log_term, entries, leader_commit):
         self.reset_heartbeat_timer()
         if term < self.current_term:
-            return False
+            return False, self.current_term, self.node_id
         if prev_log_index > len(self.log) or self.log[prev_log_index] != prev_log_term:
-            return False
+            return False, self.current_term, self.node_id
         if len(entries) > 0:
             for i, entry in enumerate(entries):
                 self.log.append(LogEntry(term, entry))
-
         if leader_commit > self.commit_index:
             self.commit_index = min(leader_commit, len(self.log))
         return True
+
+    @Pyro5.server.expose
+    def send_message(self, message):
+        print(f"Node {self.node_id} received message: {message}")
+        self.log.append(LogEntry(self.current_term, message))
+        self.send_append(message)
 
 
 portD = int(os.environ.get("PORT"))
@@ -238,3 +256,30 @@ daemon = Pyro5.server.Daemon(port=portD)
 threading.Thread(target=daemon.requestLoop).start()
 
 raft_node = RaftNode(int(os.environ.get("NODE_ID")), daemon)
+# def start_heartbeat_timer(self) -> None:
+#     if(self.state != RaftStatus.LEADER):
+#         return
+#
+#     timeout = random.randint(50, 100) / 100
+#     self.heartbeat_timer = threading.Timer(timeout, self.send_heartbeat_broadcast)
+#     self.heartbeat_timer.start()
+#
+# def send_heartbeat_broadcast(self):
+#     try:
+#         self.heartbeat_timer.cancel()
+#
+#         if(self.state != RaftStatus.LEADER):
+#             return
+#
+#         self.nodes = self.search_nod
+#     if not self.nodes:
+#         return
+#
+# threads = []
+# for node_name, node_uri in self.nodes.items():
+#     thread = threading.Thread(target=self.send_heartbeat_to_node, args=(node_name, node_uri))
+#     threads.append(thread)
+#     thread.start()
+#
+# for thread in threads:
+#     thread.join()
