@@ -70,7 +70,7 @@ class RaftNode:
         self.votes_received = 0
         self.election_timer = threading.Timer(random.uniform(150.00, 300.00) / 1000,
                                               self.handle_election_timeout)
-        self.heartbeat_timer = threading.Timer(random.uniform(1000.00, 2000.00) / 1000,
+        self.heartbeat_timer = threading.Timer(random.uniform(150.00, 300.00) / 1000,
                                                self.handle_heartbeat_timeout).start()
 
     def start_election(self):
@@ -115,12 +115,16 @@ class RaftNode:
         self.reset_heartbeat_timer()
         print(f"Node {self.node_id} became follower for term {self.current_term}")
 
-    def commit_entry(self):
-        pass
+    def commit_entry(self,last_entry:LogEntry):
+        # write log to file
+        file = open(f"node_{self.node_id}_log.txt", "a")
+        file.write(f"{last_entry.term} - {last_entry.command}\n")
+        return True
 
-    def send_append(self, message=[]):
+    def send_append(self, message=None):
         if message is None:
             message = []
+        responses_true = 0
         for node_id in self.other_nodes:
             try:
                 print(f"Node {self.node_id} sending heartbeat to node {node_id}")
@@ -131,11 +135,18 @@ class RaftNode:
                 print(f"Node {self.node_id} sending heartbeat to node {node_id} with prev_log_index {prev_log_index}")
                 r = obj.append_entries(self.node_id, self.current_term, prev_log_index, self.current_term, message,
                                        self.commit_index)
+                print(f"Response: {r}")
                 if r[0] is False:
                     self.become_follower(r[1], r[2])
+                else:
+                    responses_true += 1
                 print(f"Node {self.node_id} received response from node {node_id}: {r}")
             except Pyro5.errors.CommunicationError as e:
                 print(f"Node {self.node_id} could not send heartbeat to node {node_id}: {e}")
+        if responses_true > (len(self.other_nodes) + 1) / 2 and message != []:
+            self.commit_index += 1
+            self.last_applied += 1
+            self.commit_entry(LogEntry(self.current_term, message))
 
     def reset_election_timer(self):
         if self.election_timer is not None:
@@ -149,7 +160,7 @@ class RaftNode:
             self.heartbeat_timer.cancel()
         if self.state is not RaftState.LEADER:
             print(f"Node {self.node_id} starting heartbeat timer")
-            self.heartbeat_timer = threading.Timer(random.uniform(1000.00, 2000.00) / 1000,
+            self.heartbeat_timer = threading.Timer(random.uniform(150.00, 300.00) / 1000,
                                                    self.handle_heartbeat_timeout)
         if self.state is RaftState.LEADER:
             print(f"Node {self.node_id} is leader, not starting heartbeat timer")
@@ -196,10 +207,10 @@ class RaftNode:
     def request_vote(self, candidate_id, term):
         if term < self.current_term:
             return False
-        # if self.voted_for is None or self.voted_for == candidate_id:
-        #     self.voted_for = candidate_id
-        #     self.state = RaftState.FOLLOWER
-        #     return True
+        if self.voted_for is None or self.voted_for == candidate_id:
+            self.voted_for = candidate_id
+            self.state = RaftState.FOLLOWER
+            return True
         return True
 
     # invoked by leader to replicate log entries (§5.3); also used as
@@ -231,15 +242,19 @@ class RaftNode:
     def append_entries(self, leader_id, term, prev_log_index, prev_log_term, entries, leader_commit):
         self.reset_heartbeat_timer()
         if term < self.current_term:
-            return False, self.current_term, self.node_id
-        if prev_log_index > len(self.log) or self.log[prev_log_index] != prev_log_term:
-            return False, self.current_term, self.node_id
+            return False, self.node_id, self.current_term
+            # if prev_log_index > len(self.log) or self.log[prev_log_index] != prev_log_term:
+        #     return False, self.current_term, self.node_id
+        if term > self.current_term:
+            self.become_follower(leader_id, term)
         if len(entries) > 0:
             for i, entry in enumerate(entries):
                 self.log.append(LogEntry(term, entry))
-        if leader_commit > self.commit_index:
-            self.commit_index = min(leader_commit, len(self.log))
-        return True
+                self.commit_entry(entry)
+        # if leader_commit > self.commit_index:
+        #     self.commit_index = min(leader_commit, len(self.log))
+
+        return True, self.node_id, self.current_term
 
     @Pyro5.server.expose
     def send_message(self, message):
